@@ -5,11 +5,11 @@ import com.alpha.showcase.common.networkfile.WebDavFile
 import com.alpha.showcase.common.networkfile.model.NetworkFile
 import com.alpha.showcase.common.networkfile.storage.remote.WebDav
 import com.alpha.showcase.common.networkfile.util.RConfig
-import com.alpha.showcase.common.utils.getExtension
 import io.ktor.http.Url
 import io.ktor.http.fullPath
 
-class NativeWebdavSourceRepo : SourceRepository<WebDav, NetworkFile>,
+class NativeWebdavSourceRepo :
+    SourceRepository<WebDav, NetworkFile>,
     FileDirSource<WebDav, NetworkFile>,
     BatchSourceRepository<WebDav, NetworkFile> {
 
@@ -39,8 +39,7 @@ class NativeWebdavSourceRepo : SourceRepository<WebDav, NetworkFile>,
             }
             Result.success(resultList)
         } catch (e: Exception) {
-            e.printStackTrace()
-            Result.failure(Exception(e.message))
+            Result.failure(e)
         }
     }
 
@@ -50,7 +49,7 @@ class NativeWebdavSourceRepo : SourceRepository<WebDav, NetworkFile>,
         filter: ((NetworkFile) -> Boolean)?
     ): Result<List<NetworkFile>> {
         val files = mutableListOf<NetworkFile>()
-        val streamResult = streamItems(remoteApi, recursive, filter) { batch ->
+        val streamResult = streamItems(remoteApi, recursive, filter, 100) { batch ->
             files.addAll(batch)
         }
         return if (streamResult.isSuccess) {
@@ -67,87 +66,67 @@ class NativeWebdavSourceRepo : SourceRepository<WebDav, NetworkFile>,
         batchSize: Int,
         onBatch: suspend (List<NetworkFile>) -> Unit
     ): Result<Long> {
-        val safeBatchSize = batchSize.coerceAtLeast(1)
+
         val rootPath = normalizeDirectoryPath(remoteApi.path.ifBlank { "/" })
-        val buffer = ArrayList<NetworkFile>(safeBatchSize)
+        val MAX_TOTAL = 300
         var emitted = 0L
 
-        suspend fun flushBuffer() {
-            if (buffer.isEmpty()) return
-            onBatch(buffer.toList())
-            emitted += buffer.size
-            buffer.clear()
-        }
-
-        fun mapToNetworkFile(file: WebDavFile): NetworkFile {
-            return NetworkFile(
+        suspend fun emitOne(file: WebDavFile): Boolean {
+            if (emitted >= MAX_TOTAL) return false
+            val nf = NetworkFile(
                 remoteApi,
                 normalizePath(file.path),
                 file.name,
                 file.isDirectory,
                 file.contentLength,
-                file.contentType.ifBlank { file.name.getExtension() },
+                file.name.getExtension(),
                 file.lastModified.ifBlank { file.creationDate }
             )
-        }
-
-        suspend fun pushIfMatched(networkFile: NetworkFile) {
-            if (filter?.invoke(networkFile) == false) {
-                return
-            }
-            buffer.add(networkFile)
-            if (buffer.size >= safeBatchSize) {
-                flushBuffer()
-            }
+            if (filter?.invoke(nf) == false) return true
+            onBatch(listOf(nf))
+            emitted++
+            return true
         }
 
         return try {
+            val urlWithoutPath = remoteApi.url.replace(Url(remoteApi.url).fullPath, "")
+            val baseUrl = urlWithoutPath.ifBlank { remoteApi.url }
+            webDavClient = WebDavClient(baseUrl, remoteApi.user, RConfig.decrypt(remoteApi.passwd))
+
             if (!recursive) {
-                webDavClient = WebDavClient(remoteApi.url, remoteApi.user, RConfig.decrypt(remoteApi.passwd))
-                val contents = webDavClient.listFiles(rootPath)
-                contents.forEach { content ->
-                    val normalized = normalizePath(content.path)
-                    if (isSamePath(normalized, rootPath)) {
-                        return@forEach
-                    }
-                    pushIfMatched(mapToNetworkFile(content))
-                }
-            } else {
-                val urlWithoutPath = remoteApi.url.replace(Url(remoteApi.url).fullPath, "")
-                val baseUrl = urlWithoutPath.ifBlank { remoteApi.url }
-                val recursiveClient = WebDavClient(baseUrl, remoteApi.user, RConfig.decrypt(remoteApi.passwd))
-                val pendingDirs = ArrayDeque<String>()
-                val visited = mutableSetOf<String>()
-                pendingDirs.add(rootPath)
+                webDavClient.listFiles(rootPath)
+                    .filter { !it.isDirectory }
+                    .take(MAX_TOTAL)
+                    .forEach { emitOne(it) }
+                return Result.success(emitted)
+            }
 
-                while (pendingDirs.isNotEmpty()) {
-                    val currentPath = normalizeDirectoryPath(pendingDirs.removeLast())
-                    if (!visited.add(currentPath)) {
-                        continue
-                    }
+            val pendingDirs = ArrayDeque<String>()
+            val visited = mutableSetOf<String>()
+            pendingDirs.add(rootPath)
 
-                    val resources = recursiveClient.listFiles(currentPath)
-                    resources.forEach { resource ->
-                        val normalized = normalizePath(resource.path)
-                        if (isSamePath(normalized, currentPath)) {
-                            return@forEach
-                        }
+            while (pendingDirs.isNotEmpty()) {
+                if (emitted >= MAX_TOTAL) break
+                val currentPath = normalizeDirectoryPath(pendingDirs.removeLast())
+                if (!visited.add(currentPath)) continue
 
-                        if (resource.isDirectory) {
-                            pendingDirs.add(normalizeDirectoryPath(normalized))
-                            return@forEach
-                        }
+                val resources = webDavClient.listFiles(currentPath)
+                for (res in resources) {
+                    if (emitted >= MAX_TOTAL) break
+                    val normalized = normalizePath(res.path)
+                    if (isSamePath(normalized, currentPath)) continue
 
-                        pushIfMatched(mapToNetworkFile(resource))
+                    if (res.isDirectory) {
+                        pendingDirs.add(normalizeDirectoryPath(normalized))
+                    } else {
+                        if (!emitOne(res)) break
                     }
                 }
             }
 
-            flushBuffer()
             Result.success(emitted)
         } catch (e: Exception) {
-            e.printStackTrace()
-            Result.failure(Exception(e.message ?: "WebDAV stream failed"))
+            Result.failure(e)
         }
     }
 
