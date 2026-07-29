@@ -1,0 +1,68 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up JDK 21 (for desktop config only)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        run: |
+          sdkmanager "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-cleanup: on-success
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x ./gradlew
+
+      - name: Create local.properties (CI stub)
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" >> local.properties
+          echo "SUPABASE_URL=https://example.supabase.co" >> local.properties
+          echo "SUPABASE_ANON_KEY=dummy-anon-key-for-ci" >> local.properties
+          echo "SENTRY_DSN=https://dummy@sentry.io/0" >> local.properties
+          echo "IP_GEO_API_KEY=dummy-ip-geo-key" >> local.properties
+          echo "TMDB_API_KEY=dummy-tmdb-key" >> local.properties
+          echo "PEXELS_API_KEY=dummy-pexels-key" >> local.properties
+          echo "UNSPLASH_API_KEY=dummy-unsplash-key" >> local.properties
+
+      - name: Build Android debug APK
+        run: |
+          ./gradlew :androidApp:assembleDebug \
+            -Pdesktop.javaHome=$JAVA_HOME_21_X64 \
+            --no-daemon \
+            --stacktrace
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: showcase-android-debug
+          path: androidApp/build/outputs/apk/debug/*.apk
